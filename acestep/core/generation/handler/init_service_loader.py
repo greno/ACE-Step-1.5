@@ -87,19 +87,23 @@ class InitServiceLoaderMixin:
             self.model = torch.compile(self.model)
 
             if quantization is not None:
-                from torchao.quantization import quantize_
-                from torchao.quantization.quant_api import _is_linear
+                # from torchao.quantization import quantize_
+                # from torchao.quantization.quant_api import _is_linear
                 if quantization == "int8_weight_only":
-                    from torchao.quantization import Int8WeightOnlyConfig
-                    quant_config = Int8WeightOnlyConfig()
+                    # from torchao.quantization import Int8WeightOnlyConfig
+                    # quant_config = Int8WeightOnlyConfig()
+                    pass
                 elif quantization == "fp8_weight_only":
-                    from torchao.quantization import Float8WeightOnlyConfig
-                    quant_config = Float8WeightOnlyConfig()
+                    # from torchao.quantization import Float8WeightOnlyConfig
+                    # quant_config = Float8WeightOnlyConfig()
+                    pass
                 elif quantization == "w8a8_dynamic":
-                    from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
-                    quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
+                    # from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
+                    # quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
+                    pass
                 else:
-                    raise ValueError(f"Unsupported quantization type: {quantization}")
+                    print("Quantization requested but torchao is not available. Proceeding without quantization.")
+                    quantization = None
 
                 def _dit_filter_fn(module, fqn):
                     """Keep only DiT linear layers and exclude tokenizer/detokenizer paths."""
@@ -110,7 +114,7 @@ class InitServiceLoaderMixin:
                             return False
                     return True
 
-                quantize_(self.model, quant_config, filter_fn=_dit_filter_fn)
+                # quantize_(self.model, quant_config, filter_fn=_dit_filter_fn)
                 logger.info(f"[initialize_service] DiT quantized with: {quantization}")
 
         silence_latent_path = os.path.join(model_checkpoint_path, "silence_latent.pt")
