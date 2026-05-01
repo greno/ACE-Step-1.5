@@ -8,6 +8,39 @@ from typing import Optional, Tuple
 import torch
 from loguru import logger
 
+from acestep import gpu_config
+
+_ROCM_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _cuda_supports_bfloat16() -> bool:
+    """Return whether the active CUDA device supports native bfloat16 kernels."""
+    return gpu_config.cuda_supports_bfloat16()
+
+
+def _resolve_rocm_dtype() -> torch.dtype:
+    """Return a safe model dtype for ROCm/HIP devices.
+
+    Uses ``float32`` by default to avoid segfaults from incomplete
+    ``bfloat16`` kernel support on some ROCm GPU configurations (e.g.
+    AMD iGPUs on Strix Halo).  Set the ``ACESTEP_ROCM_DTYPE`` environment
+    variable to ``float16`` or ``bfloat16`` to override for hardware that
+    fully supports those formats.
+    """
+    raw = os.environ.get("ACESTEP_ROCM_DTYPE", "float32").strip().lower()
+    dtype = _ROCM_DTYPE_MAP.get(raw)
+    if dtype is None:
+        logger.warning(
+            f"[initialize_service] Unknown ACESTEP_ROCM_DTYPE={raw!r}; "
+            "falling back to float32."
+        )
+        dtype = torch.float32
+    return dtype
+
 
 class InitServiceOrchestratorMixin:
     """Public ``initialize_service`` orchestration entrypoint."""
@@ -24,6 +57,7 @@ class InitServiceOrchestratorMixin:
         quantization: Optional[str] = None,
         prefer_source: Optional[str] = None,
         use_mlx_dit: bool = True,
+        vae_checkpoint: Optional[str] = None,
     ) -> Tuple[str, bool]:
         """Initialize model artifacts and runtime backends for generation.
 
@@ -48,21 +82,64 @@ class InitServiceOrchestratorMixin:
                 quantization=quantization,
             )
             self.compiled = normalized_compile
-            self.dtype = torch.bfloat16 if resolved_device in ["cuda", "xpu"] else torch.float32
+            if resolved_device == "cuda" and gpu_config.is_rocm_available():
+                self.dtype = _resolve_rocm_dtype()
+                logger.info(
+                    f"[initialize_service] ROCm/HIP device detected: using dtype={self.dtype} "
+                    "(set ACESTEP_ROCM_DTYPE=bfloat16 or float16 to override)"
+                )
+            elif resolved_device == "cuda":
+                if gpu_config.cuda_supports_bfloat16():
+                    self.dtype = torch.bfloat16
+                else:
+                    self.dtype = torch.float16
+                    logger.info(
+                        "[initialize_service] Pre-Ampere CUDA detected: "
+                        "using float16 instead of bfloat16."
+                    )
+            else:
+                self.dtype = torch.bfloat16 if resolved_device == "xpu" else torch.float32
             self.quantization = normalized_quantization
-            self._validate_quantization_setup(
-                quantization=self.quantization,
-                compile_model=normalized_compile,
-            )
+            try:
+                self._validate_quantization_setup(
+                    quantization=self.quantization,
+                    compile_model=normalized_compile,
+                )
+            except ImportError as exc:
+                if self.quantization is not None:
+                    logger.warning(
+                        "[initialize_service] Quantization disabled: {}",
+                        exc,
+                    )
+                    self.quantization = None
+                else:
+                    raise
 
-            base_root = project_root or self._get_project_root()
-            checkpoint_dir = os.path.join(base_root, "checkpoints")
+            from acestep.model_downloader import (
+                DEFAULT_VAE_VARIANT,
+                get_checkpoints_dir,
+            )
+            env_ckpt = os.environ.get("ACESTEP_CHECKPOINTS_DIR")
+            if env_ckpt:
+                checkpoint_dir = str(get_checkpoints_dir())
+            elif project_root:
+                checkpoint_dir = os.path.join(project_root, "checkpoints")
+            else:
+                checkpoint_dir = str(get_checkpoints_dir())
             checkpoint_path = Path(checkpoint_dir)
+
+            # Resolve VAE selection: explicit param > env var > default.
+            resolved_vae_variant = (
+                vae_checkpoint
+                or os.environ.get("ACESTEP_VAE_CHECKPOINT")
+                or DEFAULT_VAE_VARIANT
+            )
 
             precheck_failure = self._ensure_models_present(
                 checkpoint_path=checkpoint_path,
                 config_path=config_path,
                 prefer_source=prefer_source,
+                vae_variant=resolved_vae_variant,
             )
             if precheck_failure is not None:
                 self.model = None
@@ -87,6 +164,7 @@ class InitServiceOrchestratorMixin:
                 checkpoint_dir=checkpoint_dir,
                 device=resolved_device,
                 compile_model=normalized_compile,
+                vae_variant=resolved_vae_variant,
             )
             text_encoder_path = self._load_text_encoder_and_tokenizer(
                 checkpoint_dir=checkpoint_dir,
@@ -110,6 +188,7 @@ class InitServiceOrchestratorMixin:
                 mlx_compile_requested=mlx_compile_requested,
                 offload_to_cpu=offload_to_cpu,
                 offload_dit_to_cpu=offload_dit_to_cpu,
+                quantization=self.quantization,
                 mlx_dit_status=mlx_dit_status,
                 mlx_vae_status=mlx_vae_status,
             )
@@ -125,6 +204,7 @@ class InitServiceOrchestratorMixin:
                 "quantization": self.quantization,
                 "use_mlx_dit": use_mlx_dit,
                 "prefer_source": prefer_source,
+                "vae_checkpoint": resolved_vae_variant,
             }
 
             return status_msg, True
@@ -138,4 +218,3 @@ class InitServiceOrchestratorMixin:
             error_msg = f"Error initializing model: {str(exc)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.exception(error_msg)
             return error_msg, False
-

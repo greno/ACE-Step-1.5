@@ -6,8 +6,32 @@ This module contains mode-switch and simple-mode related handlers to keep
 
 from typing import Any, Sequence
 
+import gradio as gr
+
 from .. import generation_handlers as gen_h
 from .context import GenerationWiringContext
+
+
+def _on_repaint_mode_change(mode, current_strength, memory):
+    """Update slider value and interactivity when repaint mode changes."""
+    if mode == "conservative":
+        new_memory = current_strength if 0.0 < current_strength < 1.0 else memory
+        return gr.update(value=0.0, interactive=False), new_memory
+    if mode == "aggressive":
+        new_memory = current_strength if 0.0 < current_strength < 1.0 else memory
+        return gr.update(value=1.0, interactive=False), new_memory
+    return gr.update(value=memory, interactive=True), memory
+
+
+def _on_repaint_strength_change(strength, current_mode):
+    """Auto-switch mode when slider hits boundary values."""
+    if strength == 0.0 and current_mode != "conservative":
+        return gr.update(value="conservative"), gr.update(interactive=False)
+    if strength == 1.0 and current_mode != "aggressive":
+        return gr.update(value="aggressive"), gr.update(interactive=False)
+    if current_mode != "balanced" and 0.0 < strength < 1.0:
+        return gr.update(value="balanced"), gr.update(interactive=True)
+    return gr.skip(), gr.skip()
 
 
 def register_generation_mode_handlers(
@@ -22,14 +46,53 @@ def register_generation_mode_handlers(
     results_section = context.results_section
     llm_handler = context.llm_handler
 
+    # Shared handler for mode-change and initial page load — extracted to
+    # avoid duplicating the lambda and to keep both call sites in sync.
+    def _handle_mode_change(mode: str, prev: str | None):
+        """Proxy mode-change handling for both .change() and .load() events."""
+        return gen_h.handle_generation_mode_change(mode, prev, llm_handler)
+
+    mode_change_inputs = [
+        generation_section["generation_mode"],
+        generation_section["previous_generation_mode"],
+    ]
+    dcw_default_outputs = [
+        generation_section["dcw_mode"],
+        generation_section["dcw_scaler"],
+        generation_section["dcw_high_scaler"],
+    ]
+
     # ========== Generation Mode Change ==========
     generation_section["generation_mode"].change(
-        fn=lambda mode, prev: gen_h.handle_generation_mode_change(mode, prev, llm_handler),
-        inputs=[
-            generation_section["generation_mode"],
-            generation_section["previous_generation_mode"],
-        ],
+        fn=_handle_mode_change,
+        inputs=mode_change_inputs,
         outputs=mode_ui_outputs,
+    )
+
+    # ========== Initial Mode State on Page Load ==========
+    # compute_mode_ui_updates() controls visibility for 44 mode-dependent UI
+    # components (think_checkbox, generate_btn_row, src_audio_row, etc.) but
+    # is only triggered via the .change() event above.  Gradio does not fire
+    # .change() for the initial value assignment, so mode-dependent state is
+    # never applied on first render — causing the Think checkbox (and
+    # potentially other components) to be missing on page load.
+    # This .load() event fires once on page load to initialize all
+    # mode-dependent UI state using the same handler.
+    load_event = context.demo.load(
+        fn=_handle_mode_change,
+        inputs=mode_change_inputs,
+        outputs=mode_ui_outputs,
+    )
+    load_event.then(
+        fn=gen_h.update_dcw_defaults_for_think,
+        inputs=[generation_section["think_checkbox"]],
+        outputs=dcw_default_outputs,
+    )
+
+    generation_section["think_checkbox"].change(
+        fn=gen_h.update_dcw_defaults_for_think,
+        inputs=[generation_section["think_checkbox"]],
+        outputs=dcw_default_outputs,
     )
 
     # ========== Extract Mode: Auto-fill caption from track_name ==========
@@ -66,7 +129,6 @@ def register_generation_mode_handlers(
         outputs=[generation_section["simple_vocal_language"]],
     )
 
-    # ========== Random Description Button ==========
     generation_section["random_desc_btn"].click(
         fn=gen_h.load_random_simple_description,
         inputs=[],
@@ -77,7 +139,6 @@ def register_generation_mode_handlers(
         ],
     )
 
-    # ========== Create Sample Button (Simple Mode) ==========
     generation_section["create_sample_btn"].click(
         fn=lambda query, instrumental, vocal_lang, temp, top_k, top_p, debug: gen_h.handle_create_sample(
             llm_handler, query, instrumental, vocal_lang, temp, top_k, top_p, debug
@@ -112,4 +173,28 @@ def register_generation_mode_handlers(
         fn=gen_h.uncheck_auto_for_populated_fields,
         inputs=list(auto_checkbox_inputs),
         outputs=list(auto_checkbox_outputs),
+    )
+
+    generation_section["repaint_mode"].change(
+        fn=_on_repaint_mode_change,
+        inputs=[
+            generation_section["repaint_mode"],
+            generation_section["repaint_strength"],
+            generation_section["repaint_strength_memory"],
+        ],
+        outputs=[
+            generation_section["repaint_strength"],
+            generation_section["repaint_strength_memory"],
+        ],
+    )
+    generation_section["repaint_strength"].change(
+        fn=_on_repaint_strength_change,
+        inputs=[
+            generation_section["repaint_strength"],
+            generation_section["repaint_mode"],
+        ],
+        outputs=[
+            generation_section["repaint_mode"],
+            generation_section["repaint_strength"],
+        ],
     )
